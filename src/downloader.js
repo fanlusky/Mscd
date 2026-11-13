@@ -1137,7 +1137,6 @@ export class Downloader {
 
         const retryable = task.tracks.filter((t) =>
             t.status !== 'done'
-            && t.status !== 'tagging'
             && t.status !== 'moved'
             && t.status !== 'removed'
         );
@@ -1921,8 +1920,22 @@ export class Downloader {
     }
 
     async downloadBatchToDisk(songs, quality, options = {}) {
-        const dirHandle = await getSavedDirHandle();
-        if (!dirHandle) throw new Error('未选择本地目录');
+        if (!supportsFileSystemAccess()) {
+            throw new Error('批量下载需要保存到文件夹，请使用桌面版 Chrome 或 Edge');
+        }
+        let parentDir = await getSavedDirHandle();
+        if (!parentDir) {
+            parentDir = await pickDownloadDir();
+            store.update({ settings: { ...store.get().settings, downloadDirName: parentDir.name } });
+            store.persist();
+        }
+        const existingTask = options.resumeTaskId
+            ? store.get().downloadTasks.find((t) => t.id === options.resumeTaskId)
+            : null;
+        if (options.resumeTaskId && !existingTask) throw new Error('任务不存在');
+        if (!await ensureDirPermission(parentDir, true)) throw new Error('没有目录写入权限');
+        const directoryName = existingTask?.directoryName || `MSCD_${Date.now()}`;
+        const dirHandle = await parentDir.getDirectoryHandle(directoryName, { create: true });
         const ok = await ensureDirPermission(dirHandle, true);
         if (!ok) throw new Error('没有目录写入权限');
 
@@ -1959,7 +1972,6 @@ export class Downloader {
             tracks = existing.tracks.map((t) => {
                 if (
                     t.status !== 'done'
-                    && t.status !== 'tagging'
                     && t.status !== 'moved'
                     && t.status !== 'removed'
                 ) {
@@ -2009,7 +2021,7 @@ export class Downloader {
             quality = tracks[0]?._quality ?? quality;
 
             const total = tracks.length;
-            const done = tracks.filter((t) => t.status === 'done' || t.status === 'tagging').length;
+            const done = tracks.filter((t) => t.status === 'done').length;
             const bytes = tracks.reduce((s, t) => s + (t.bytes || 0), 0);
             const totalBytes = tracks.reduce((s, t) => s + (t.totalBytes || 0), 0);
 
@@ -2019,6 +2031,8 @@ export class Downloader {
                         ...t,
                         status: 'active',
                         phase: 'downloading',
+                        mode: 'batch-disk',
+                        directoryName,
                         tracks,
                         done,
                         bytes,
@@ -2078,6 +2092,7 @@ export class Downloader {
                 type: 'batch',
                 kind: onlyLyricMode ? 'batch-lyric' : 'batch-audio',
                 mode: 'batch-disk',
+                directoryName,
                 label: onlyLyricMode ? `下载歌词 ${total} 首` : batchLabel,
                 status: 'active',
                 phase: 'downloading',
@@ -2402,12 +2417,12 @@ export class Downloader {
                     error: t.error || '未知错误',
                 }));
             const successCount = (finalTask?.tracks || []).filter(
-                (t) => t.status === 'done' || t.status === 'tagging'
+                (t) => t.status === 'done'
             ).length;
 
             store.upsertDownloadTask(taskId, {
-                status: 'done',
-                phase: 'done',
+                status: state.abortController.signal.aborted ? 'cancelled' : 'done',
+                phase: state.abortController.signal.aborted ? 'error' : 'done',
                 errors: allErrors,
                 finishedAt: Date.now(),
             });
@@ -2417,7 +2432,7 @@ export class Downloader {
 
             const successKindsBySongId = {};
             for (const track of finalTask?.tracks || []) {
-                if (track.status !== 'done' && track.status !== 'tagging') continue;
+                if (track.status !== 'done') continue;
                 const sid = String(track.songId || '');
                 if (!sid) continue;
                 const kind = track._kind || 'audio';
@@ -2446,564 +2461,8 @@ export class Downloader {
         }
     }
 
+    // 兼容旧入口和已持久化的 ZIP 任务，统一逐首保存到文件夹。
     async downloadAsZip(songs, quality, options = {}) {
-        const { retry, retryDelay } = this.config.download;
-        const concurrency = store.get().settings.concurrency ?? this.config.download.concurrency;
-        const tagConcurrency = Math.max(2, Math.min(4, concurrency));
-
-        if (!options.resumeTaskId && Array.isArray(songs)) {
-            if (songs.length > 1) {
-                const allDownloads = store.get().downloads;
-                songs = songs.map((s) => {
-                    if (!s || !s.id) return s;
-                    const idx = allDownloads.findIndex((d) => String(d.id) === String(s.id));
-                    return idx >= 0 ? { ...s, _seqIndex: idx + 1 } : s;
-                });
-            }
-            songs = this.expandDownloadEntries(songs);
-        }
-
-        let taskId;
-        let tracks;
-
-        if (options.resumeTaskId) {
-            const existing = store.get().downloadTasks.find((t) => t.id === options.resumeTaskId);
-            if (!existing || !existing.tracks) throw new Error('任务不存在');
-            taskId = existing.id;
-
-            tracks = existing.tracks.map((t) => {
-                if (
-                    t.status !== 'done'
-                    && t.status !== 'tagging'
-                    && t.status !== 'moved'
-                    && t.status !== 'removed'
-                ) {
-                    return {
-                        ...t,
-                        status: 'queued',
-                        bytes: 0,
-                        totalBytes: 0,
-                        progress: 0,
-                        speed: 0,
-                        eta: null,
-                        error: null,
-                        paused: false,
-                        startedAt: null,
-                        finishedAt: null,
-                    };
-                }
-                return t;
-            });
-
-            songs = tracks.map((t) => ({
-                id: t.songId,
-                title: t.title,
-                artist: t.artist,
-                album: t.album || '',
-                pic: t.pic || '',
-                _quality: t._quality,
-                _kind: t._kind || (t._lyricOnly ? 'lyric' : 'audio'),
-                _withLyric: t._withLyric,
-                _lyricOnly: t._lyricOnly,
-                _lyricWithTranslation: !!t._lyricWithTranslation,
-                _lyricDelay: Number(t._lyricDelay) || 0,
-                _metaTitle: t._metaTitle,
-                _metaArtist: t._metaArtist,
-                _metaAlbum: t._metaAlbum,
-                _metaYear: t._metaYear,
-                _metaBpm: t._metaBpm,
-                _metaGenre: t._metaGenre,
-                _metaCover: t._metaCover,
-                _mvDownload: t._mvDownload,
-                _mvQuality: t._mvQuality,
-                _mvFallback: t._mvFallback,
-                _skipAudio: t._skipAudio,
-                _seqIndex: Number(t._seqIndex) || 0,
-            }));
-
-            quality = tracks[0]?._quality ?? quality;
-
-            const total = tracks.length;
-            const done = tracks.filter((t) => t.status === 'done' || t.status === 'tagging').length;
-            const bytes = tracks.reduce((s, t) => s + (t.bytes || 0), 0);
-            const totalBytes = tracks.reduce((s, t) => s + (t.totalBytes || 0), 0);
-
-            store.update({
-                downloadTasks: store.get().downloadTasks.map((t) =>
-                    t.id === taskId ? {
-                        ...t,
-                        status: 'active',
-                        phase: 'downloading',
-                        tracks,
-                        done,
-                        bytes,
-                        totalBytes,
-                        packagingProgress: null,
-                        errors: [],
-                        finishedAt: null,
-                    } : t
-                ),
-            });
-        } else {
-            if (!songs.length) throw new Error('下载列表为空');
-            taskId = newTaskId();
-            const total = songs.length;
-            tracks = songs.map((song, index) => ({
-                id: `trk-${taskId}-${index}`,
-                songId: song.id,
-                title: song.title || '未知歌曲',
-                artist: song.artist || '',
-                album: song.album || '',
-                pic: song.pic || '',
-                _quality: song._quality ?? quality,
-                _kind: song._kind || 'audio',
-                _withLyric: !!song._withLyric,
-                _lyricOnly: !!song._lyricOnly,
-                _lyricWithTranslation: !!song._lyricWithTranslation,
-                _lyricDelay: Number(song._lyricDelay) || 0,
-                _metaTitle: song._metaTitle,
-                _metaArtist: song._metaArtist,
-                _metaAlbum: song._metaAlbum,
-                _metaYear: song._metaYear,
-                _metaBpm: song._metaBpm,
-                _metaGenre: song._metaGenre,
-                _metaCover: song._metaCover,
-                _mvDownload: !!song._mvDownload,
-                _mvQuality: song._mvQuality,
-                _mvFallback: song._mvFallback,
-                _skipAudio: !!song._skipAudio,
-                _seqIndex: Number(song._seqIndex) || 0,
-                status: 'queued',
-                bytes: 0,
-                totalBytes: 0,
-                progress: 0,
-                speed: 0,
-                eta: null,
-                error: null,
-                paused: false,
-                startedAt: null,
-                finishedAt: null,
-            }));
-
-            const uniqueSongIds = new Set(songs.map((s) => String(s.id || s.songId || '')));
-            const isSingleSongBatch = uniqueSongIds.size === 1;
-            const batchLabel = isSingleSongBatch
-                ? `${songs[0].title || '未知歌曲'} - ${songs[0].artist || '未知艺人'}`
-                : `批量下载 ${total} 个任务`;
-            store.upsertDownloadTask(taskId, {
-                type: 'batch',
-                mode: 'batch-zip',
-                label: batchLabel,
-                status: 'active',
-                phase: 'downloading',
-                done: 0,
-                total,
-                bytes: 0,
-                totalBytes: 0,
-                packagingProgress: null,
-                errors: [],
-                startedAt: Date.now(),
-                finishedAt: null,
-                tracks,
-            });
-        }
-
-        const state = {
-            abortController: new AbortController(),
-            trackControllers: new Map(),
-            packageRequested: false,
-            paused: new Set(),
-            pauseResolvers: new Map(),
-            priorityQueue: [],
-            mode: 'batch-zip',
-            autoRetriedTracks: new Set(),
-        };
-        this.taskStates.set(taskId, state);
-
-        const updateTrack = (trackId, patch) => store.updateTaskTrack(taskId, trackId, patch);
-
-        const artifactByTrackId = new Map();
-        const tagSem = new Semaphore(tagConcurrency);
-        const tagPromises = [];
-
-        const worker = async (song, index) => {
-            const trackId = tracks[index].id;
-
-            if (state.abortController.signal.aborted) throw new Error('已取消');
-            if (state.packageRequested) {
-                updateTrack(trackId, { status: 'skipped', finishedAt: Date.now() });
-                return { skipped: true };
-            }
-
-            const cur = store.get().downloadTasks.find((t) => t.id === taskId);
-            if (!cur) throw new Error('任务已移除');
-            const track = cur.tracks.find((t) => t.id === trackId);
-            if (!track || track.status !== 'queued') {
-                return { skipped: true };
-            }
-
-            const controller = new AbortController();
-            state.trackControllers.set(trackId, controller);
-            const checkPause = buildCheckPause(state, trackId, controller);
-
-            try {
-                updateTrack(trackId, { status: 'resolving', startedAt: Date.now() });
-
-                if (song._lyricOnly) {
-                    updateTrack(trackId, { status: 'downloading' });
-                    const lrc = await this.fetchLyricText(song);
-                    if (!lrc) throw new Error('暂无歌词');
-                    const filename = buildBaseName(song) + '.lrc';
-                    const size = new Blob([lrc]).size;
-                    artifactByTrackId.set(trackId, { kind: 'lyric', lyric: lrc, filename });
-                    this._recordHistory(song, { kind: 'lyric', filename, bytes: size });
-                    updateTrack(trackId, {
-                        status: 'done',
-                        bytes: size,
-                        totalBytes: size,
-                        progress: 1,
-                        speed: 0,
-                        eta: 0,
-                        finishedAt: Date.now(),
-                    });
-                    return { meta: { filename }, blob: null, lyric: lrc };
-                }
-
-                const meta = await this.prepare(song, quality);
-
-                if (controller.signal.aborted || state.abortController.signal.aborted) {
-                    throw new Error('已取消');
-                }
-
-                if (meta.kind === 'mv') {
-                    updateTrack(trackId, { title: meta.title, artist: meta.artist, pic: meta.cover });
-                }
-
-                updateTrack(trackId, { status: 'downloading' });
-
-                const proxyUrl = proxied(meta.url);
-                const threads = store.get().settings.downloadThreads || 8;
-
-                let bytes = 0;
-                let contentLength = 0;
-                const startTime = Date.now();
-
-                const blob = await downloadWithThreads(proxyUrl, {
-                    retries: retry,
-                    retryDelay,
-                    threads,
-                    signal: controller.signal,
-                    checkPause,
-                    onProgress: (downloaded, total) => {
-                        bytes = downloaded;
-                        contentLength = total;
-                        const elapsed = (Date.now() - startTime) / 1000;
-                        const speed = elapsed > 0 ? bytes / elapsed : 0;
-                        const eta = (contentLength > 0 && speed > 0) ? (contentLength - bytes) / speed : null;
-                        updateTrack(trackId, {
-                            bytes,
-                            totalBytes: contentLength,
-                            progress: contentLength > 0 ? Math.min(1, bytes / contentLength) : 0,
-                            speed,
-                            eta,
-                        });
-                    },
-                });
-
-                if (controller.signal.aborted || state.abortController.signal.aborted) {
-                    throw new Error('已取消');
-                }
-
-                updateTrack(trackId, { status: 'tagging' });
-
-                const tagPromise = (async () => {
-                    await tagSem.acquire();
-                    try {
-                        if (state.abortController.signal.aborted) {
-                            throw new Error('已取消');
-                        }
-                        await applyDetectedExt(blob, meta);
-                        const finalBlob = await this.writeTags(blob, meta);
-                        let lyric = null;
-                        if (song._withLyric) {
-                            lyric = await this.fetchLyricText(song);
-                        }
-                        artifactByTrackId.set(trackId, { kind: 'audio', blob: finalBlob, lyric, filename: meta.filename });
-                        if (lyric) {
-                            this._recordHistory(song, {
-                                kind: 'lyric',
-                                filename: toLrcName(meta.filename),
-                                bytes: new Blob([lyric]).size,
-                            });
-                        }
-                        this._recordHistory(song, {
-                            kind: meta.kind === 'mv' ? 'mv' : 'audio',
-                            quality: meta.kind === 'mv' ? meta.br : undefined,
-                            filename: meta.filename,
-                            bytes,
-                        });
-                        updateTrack(trackId, {
-                            status: 'done',
-                            bytes,
-                            totalBytes: contentLength || bytes,
-                            progress: 1,
-                            speed: 0,
-                            eta: 0,
-                            finishedAt: Date.now(),
-                        });
-                        return { ok: true, meta, blob: finalBlob, lyric };
-                    } catch (err) {
-                        const cancelled = isCancelledError(err) || state.abortController.signal.aborted;
-                        updateTrack(trackId, {
-                            status: cancelled ? 'cancelled' : 'error',
-                            error: cancelled ? null : err.message,
-                            speed: 0,
-                            eta: 0,
-                            finishedAt: Date.now(),
-                        });
-                        return { ok: false, error: err, song };
-                    } finally {
-                        tagSem.release();
-                    }
-                })();
-
-                tagPromises.push(tagPromise);
-                return { ok: true };
-            } catch (err) {
-                const cancelled = controller.signal.aborted || state.abortController.signal.aborted || isCancelledError(err);
-                if (!cancelled && !state.autoRetriedTracks.has(trackId)) {
-                    state.autoRetriedTracks.add(trackId);
-                    store.updateTaskTrack(taskId, trackId, {
-                        status: 'queued',
-                        bytes: 0,
-                        totalBytes: 0,
-                        progress: 0,
-                        speed: 0,
-                        eta: null,
-                        error: null,
-                        paused: false,
-                        startedAt: null,
-                        finishedAt: null,
-                    });
-                    if (state.pendingIndices && !state.pendingIndices.includes(index)) {
-                        state.pendingIndices.unshift(index);
-                    }
-                    return;
-                }
-                updateTrack(trackId, {
-                    status: cancelled ? 'cancelled' : 'error',
-                    error: cancelled ? null : err.message,
-                    speed: 0,
-                    eta: 0,
-                    finishedAt: Date.now(),
-                });
-                throw err;
-            } finally {
-                state.trackControllers.delete(trackId);
-            }
-        };
-
-        const pendingIndices = [];
-        state.pendingIndices = pendingIndices;
-
-        const takeNext = () => {
-            while (state.priorityQueue.length) {
-                const id = state.priorityQueue.shift();
-                const idx = tracks.findIndex((t) => t.id === id);
-                if (idx === -1) continue;
-                const pos = pendingIndices.indexOf(idx);
-                if (pos >= 0) {
-                    pendingIndices.splice(pos, 1);
-                    return idx;
-                }
-            }
-            return pendingIndices.length ? pendingIndices.shift() : -1;
-        };
-
-        try {
-            while (true) {
-                if (state.abortController.signal.aborted) break;
-
-                const live = store.get().downloadTasks.find((t) => t.id === taskId);
-                if (!live) break;
-
-                pendingIndices.length = 0;
-                tracks.forEach((t, i) => {
-                    const cur = live.tracks.find((x) => x.id === t.id);
-                    if (cur && cur.status === 'queued') pendingIndices.push(i);
-                });
-
-                if (!pendingIndices.length) {
-                    if (state.resumeRequested) {
-                        state.resumeRequested = false;
-                        continue;
-                    }
-                    await new Promise((r) => setTimeout(r, 30));
-                    const live2 = store.get().downloadTasks.find((t) => t.id === taskId);
-                    if (!live2) break;
-                    pendingIndices.length = 0;
-                    tracks.forEach((t, i) => {
-                        const cur = live2.tracks.find((x) => x.id === t.id);
-                        if (cur && cur.status === 'queued') pendingIndices.push(i);
-                    });
-                    if (!pendingIndices.length) break;
-                    continue;
-                }
-
-                const workerCount = Math.max(1, Math.min(concurrency, pendingIndices.length));
-                const workers = Array.from({ length: workerCount }, async () => {
-                    while (true) {
-                        if (state.abortController.signal.aborted) return;
-                        const idx = takeNext();
-                        if (idx === -1) return;
-                        try {
-                            await worker(songs[idx], idx);
-                        } catch {}
-                    }
-                });
-                await Promise.all(workers);
-            }
-
-            await Promise.all(tagPromises);
-
-            const cur = store.get().downloadTasks.find((t) => t.id === taskId);
-            if (cur) {
-                for (const track of cur.tracks) {
-                    if (track.status === 'queued' || track.status === 'resolving') {
-                        updateTrack(track.id, { status: 'skipped', finishedAt: Date.now() });
-                    }
-                }
-            }
-
-            if (state.abortController.signal.aborted) {
-                this.taskStates.delete(taskId);
-                store.upsertDownloadTask(taskId, {
-                    status: 'cancelled',
-                    phase: 'error',
-                    errors: [],
-                    finishedAt: Date.now(),
-                });
-                throw new Error('已取消');
-            }
-
-            const finalTask = store.get().downloadTasks.find((t) => t.id === taskId);
-            const successful = [];
-            const errors = [];
-
-            for (const track of (finalTask?.tracks || [])) {
-                if (track.status === 'done' || track.status === 'tagging') {
-                    const artifact = artifactByTrackId.get(track.id);
-                    if (!artifact) continue;
-                    successful.push({ track, ...artifact });
-                } else if (track.status === 'error') {
-                    errors.push({
-                        song: { id: track.songId, title: track.title, artist: track.artist },
-                        error: track.error || '未知错误',
-                    });
-                }
-            }
-
-            if (!successful.length) {
-                this.taskStates.delete(taskId);
-                store.upsertDownloadTask(taskId, {
-                    status: 'cancelled',
-                    phase: 'error',
-                    errors,
-                    finishedAt: Date.now(),
-                });
-                return { taskId, successful: 0, failed: errors.length, errors };
-            }
-
-            store.upsertDownloadTask(taskId, {
-                phase: 'packaging',
-                packagingProgress: 0,
-                errors,
-            });
-
-            const zip = new window.JSZip();
-            const categoryMode = store.get().settings.batchCategory || 'none';
-            const lyricMode = store.get().settings.lyricSaveMode || 'same';
-            const mvMode = store.get().settings.mvDirMode || 'same';
-            for (const { track, kind, blob, lyric, filename } of successful) {
-                let folder = '';
-                const isMv = track._kind === 'mv';
-                if (isMv && mvMode === 'separate') {
-                    folder = 'MV/';
-                } else if (categoryMode === 'artist') {
-                    const a = getMainArtist(track.artist);
-                    if (a) folder = sanitizeFilename(a) + '/';
-                } else if (categoryMode === 'album') {
-                    const al = track.album;
-                    if (al) folder = sanitizeFilename(al) + '/';
-                }
-                if (kind === 'lyric') {
-                    zip.file(folder + filename, lyric);
-                    continue;
-                }
-                if (blob) {
-                    zip.file(folder + filename, blob);
-                }
-                if (lyric) {
-                    const lrcName = toLrcName(filename);
-                    const lrcFolder = lyricMode === 'separate' ? '歌词/' : folder;
-                    zip.file(lrcFolder + lrcName, lyric);
-                }
-            }
-
-            let lastPackagingTick = 0;
-            const zipBlob = await zip.generateAsync(
-                { type: 'blob' },
-                (metadata) => {
-                    const now = Date.now();
-                    if (now - lastPackagingTick < 200 && metadata.percent < 100) return;
-                    lastPackagingTick = now;
-                    store.upsertDownloadTask(taskId, {
-                        phase: 'packaging',
-                        packagingProgress: metadata.percent / 100,
-                    }, { persist: false });
-                }
-            );
-
-            triggerDownload(zipBlob, `MSCD_${Date.now()}.zip`);
-
-            store.upsertDownloadTask(taskId, {
-                status: 'done',
-                phase: 'done',
-                packagingProgress: 1,
-                errors,
-                finishedAt: Date.now(),
-            });
-
-            this.taskStates.delete(taskId);
-
-            const successKindsBySongId = {};
-            for (const item of successful) {
-                const track = item.track;
-                if (!track) continue;
-                const sid = String(track.songId || '');
-                if (!sid) continue;
-                const kind = track._kind || 'audio';
-                if (!successKindsBySongId[sid]) successKindsBySongId[sid] = [];
-                successKindsBySongId[sid].push(kind);
-            }
-            this._notifyTaskComplete(taskId, successKindsBySongId);
-
-            return {
-                taskId,
-                successful: successful.length,
-                failed: errors.length,
-                errors,
-            };
-        } catch (err) {
-            const cancelled = isCancelledError(err) || state.abortController.signal.aborted;
-            this.taskStates.delete(taskId);
-            store.upsertDownloadTask(taskId, {
-                status: cancelled ? 'cancelled' : 'error',
-                phase: 'error',
-                errors: cancelled ? [] : [{ song: null, error: err.message }],
-                finishedAt: Date.now(),
-            });
-            throw err;
-        }
+        return this.downloadBatchToDisk(songs, quality, options);
     }
 }

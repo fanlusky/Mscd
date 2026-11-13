@@ -61,7 +61,7 @@ https://mscdownload.pages.dev/
 - **Router**：基于 `location.hash`，同步 `playbackOpen` / `search.detail` / `view` 到 URL，支持前进后退与分享链接。路由形态：`#/song/:id`、`#/song/:id?mode=mv`、`#/mv/:mvid`、`#/artist|album|playlist/:id`、`#/search?q=&type=&page=`、`#/queue|downloads|status|settings|myfavorites`。
 - **Proxy（可选）**：`functions/proxy.js` 运行于 Cloudflare Edge，处理 CORS、Range 透传、SSRF 防护（拒绝本地 / 内网地址），并**拒绝 3xx 重定向**（`redirect: 'manual'`）。默认关闭，用户在设置里开启 `apiProxy` / `playProxy` / `downloadProxy` 后才生效。
 - **Wiki Worker**：`src/wiki-worker.js` 为独立 module Worker，按批次并发抓取百科（并发 4、批次 16），结果写入 IndexedDB（`mscd-wiki`）。
-- **Downloader**：`src/downloader.js` 使用 File System Access API 的目录句柄持久化在 IndexedDB（`mscd-fs`），支持 blob / stream / batch-zip 三种模式。
+- **Downloader**：`src/downloader.js` 使用 File System Access API 的目录句柄持久化在 IndexedDB（`mscd-fs`），支持单首浏览器下载和逐首保存到本地文件夹。批量任务不再生成 ZIP：在选定目录下创建 `MSCD_时间戳` 文件夹，每首完成后立即写入，失败重试继续使用原任务文件夹，已完成文件保持不变。首次批量下载需选择并授权目录，请使用支持 File System Access API 的桌面版 Chrome / Edge。
 
 ## 项目结构
 
@@ -219,7 +219,6 @@ export const config = {
 
 **CDN 依赖**：
 
-- `jszip@3.10.1`（batch-zip 打包）
 - `browser-id3-writer@4.0.0`（MP3 标签）
 - `qrcode-generator@1.4.4`（分享图二维码）
 - 字体：`LXGW WenKai Light`（jsDelivr）、`Poiret One`（Google Fonts）

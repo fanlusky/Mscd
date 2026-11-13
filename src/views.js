@@ -2919,14 +2919,14 @@ function openQuickDownloadSettingsModal(ctx) {
         });
         group.appendChild(el('div', { class: 'ena-radio-group' },
             el('label', { class: 'ena-radio' },
-                blobInput, el('span', { class: 'dot' }), el('span', { text: '内存缓存' })),
+                blobInput, el('span', { class: 'dot' }), el('span', { text: '单首浏览器下载 / 批量保存到文件夹' })),
             el('label', { class: 'ena-radio' },
                 streamInput, el('span', { class: 'dot' }), el('span', { text: '直接流式下载到本地' }))
         ));
         if (!supported) {
             group.appendChild(el('div', {
                 class: 'setting-hint',
-                text: '当前浏览器不支持 File System Access API，只能使用内存缓存。',
+                text: '当前浏览器仅支持单首浏览器下载；批量保存文件夹请使用桌面版 Chrome 或 Edge。',
             }));
         }
         body.appendChild(group);
@@ -3886,8 +3886,6 @@ export function StatusView(ctx) {
     function rebuildActions(cache, task) {
         const isActive = task.status === 'active';
         const isWaiting = task.status === 'waiting';
-        const isZip = task.mode === 'batch-zip';
-        const canPackage = isActive && isZip && task.phase !== 'packaging' && task.phase !== 'done';
         const canToggleExpand = task.type === 'batch';
         const tracksArr = task.tracks || [];
         const anyPaused = tracksArr.some((t) => t.paused);
@@ -3895,7 +3893,7 @@ export function StatusView(ctx) {
             t.status === 'downloading' || t.status === 'queued' || t.status === 'resolving' || t.status === 'tagging'
         );
 
-        const key = `${isActive}|${isWaiting}|${canPackage}|${anyPaused}|${hasUnfinished}|${canToggleExpand}`;
+        const key = `${isActive}|${isWaiting}|${anyPaused}|${hasUnfinished}|${canToggleExpand}`;
 
         if (cache.actionsKey !== key) {
             cache.actionsKey = key;
@@ -3936,17 +3934,6 @@ export function StatusView(ctx) {
                     });
                 });
                 cache.actionsEl.appendChild(cancelBtn);
-            }
-
-            if (canPackage) {
-                const pkgBtn = makeTaskIconBtn('package', '立即打包', () => {
-                    confirmDialog('立即打包？排队中和后续的歌曲将被跳过。').then((ok) => {
-                        if (!ok) return;
-                        downloader.packageNow(task.id);
-                        Toast('已请求立即打包', 'info', 1600);
-                    });
-                });
-                cache.actionsEl.appendChild(pkgBtn);
             }
 
             if (!isActive) {
@@ -4729,7 +4716,7 @@ export function SettingsView(ctx) {
             el('label', { class: 'ena-radio' },
                 blobInput,
                 el('span', { class: 'dot' }),
-                el('span', { text: '内存缓存' })
+                el('span', { text: '单首浏览器下载 / 批量保存到文件夹' })
             ),
             el('label', { class: 'ena-radio' },
                 streamInput,
@@ -4742,7 +4729,7 @@ export function SettingsView(ctx) {
         if (!supported) {
             modeGroup.appendChild(el('div', {
                 class: 'setting-hint',
-                text: '当前浏览器不支持 File System Access API，只能使用内存缓存。'
+                text: '当前浏览器仅支持单首浏览器下载；批量保存文件夹请使用桌面版 Chrome 或 Edge。'
             }));
         }
 
