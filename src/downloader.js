@@ -220,6 +220,7 @@ async function fetchWikiFields(id) {
 
 function proxied(url) {
     if (!url) return '';
+    if (!config.proxy) return url;
     if (!store.get().settings.downloadProxy) return url;
     if (url.startsWith(config.proxy)) return url;
     return config.proxy + encodeURIComponent(url);

@@ -11,7 +11,7 @@
 
 > 自述文件部分由 LLM 生成。
 
-以 NeteaseCloudMusicApi 为主后端、Meting API 作音频源的 Web 音乐客户端。原生 ES Modules，clone 即可运行，无构建步骤，部署于 Cloudflare Pages，可选 Pages Functions 作为边缘代理。
+以 NeteaseCloudMusicApi 为主后端、Meting API 作音频源的 Web 音乐客户端。原生 ES Modules，clone 即可运行，无构建步骤，支持 GitHub Pages 与 Cloudflare Pages 部署，可选 Cloudflare Pages Functions 作为边缘代理。
 
 本项目仅为客户端实现，不提供音乐存储与检索服务。所有数据来源于使用者自行配置的第三方接口。
 
@@ -183,6 +183,25 @@ export const config = {
 
 ## 部署
 
+### GitHub Pages
+
+本仓库已包含 `.github/workflows/pages.yml`，无需安装依赖或运行构建命令。
+
+1. 将项目推送到你自己的 GitHub 仓库。
+2. 打开仓库 **Settings → Pages → Build and deployment**，将 **Source** 设为 **GitHub Actions**。
+3. 推送到 `main` 分支即可自动部署；也可在 **Actions → Deploy to GitHub Pages → Run workflow** 手动触发。
+4. 工作流成功后，通过 `https://<用户名>.github.io/<仓库名>/` 访问。当前仓库地址为 https://fanlusky.github.io/Mscd/ 。
+
+发布目录只包含页面、脚本、样式、主题及许可证，不上传 `.git`、文档截图或 Cloudflare 服务端代码。资源使用相对路径，路由使用 `#/...`，兼容仓库子路径和刷新访问，无需设置 `base` 或添加 `404.html`。
+
+**后端与代理：**
+
+- GitHub Pages 无法执行 `functions/proxy.js`，也不会托管 Netease / Meting 后端。
+- `config.backends` 中保留了原项目的第三方接口；能否搜索、播放和下载取决于这些接口的可用性及其对站点来源的 CORS 支持。长期使用建议配置自己的 HTTPS 接口。
+- `config.proxy` 默认留空，直接访问接口和音频源；未部署代理时请保持设置中的 API / 播放 / 下载代理关闭。
+- 如需跨域代理，可单独将 `functions/proxy.js` 部署到 Cloudflare Pages，再把完整地址（如 `https://your-project.pages.dev/proxy?url=`）填入 `config.proxy`。仅在 GitHub Pages 地址后添加 `/proxy` 无法启用代理。
+- 修改 `config.js` 并推送到 `main` 后，工作流会自动更新线上配置。前端配置会公开给访问者，请勿填入私密令牌。
+
 ### Cloudflare Pages
 
 1. Fork 本仓库。
@@ -195,7 +214,7 @@ export const config = {
    ```js
    proxy: 'https://your-project.pages.dev/proxy?url=',
    ```
-   **不改会 404**——默认值 `https://mscdownload.legspcpd.asia/proxy?url=` 是演示站，你的 fork 没有这个域名。代理默认关闭（`settings.apiProxy` / `playProxy` / `downloadProxy` 全为 `false`），只有用户在设置里开启才走代理，主要用途是绕过音频源的 CORS 和跨域限制。
+   `proxy` 默认留空；需要代理时应填写自己部署的地址。代理设置默认关闭（`settings.apiProxy` / `playProxy` / `downloadProxy` 全为 `false`）；此外，已配置代理时，播放的跨域检测和下载封面获取也可能自动使用代理。
 6. `wrangler.toml` 的 `compatibility_date = "2024-07-17"`，升级前建议先在本地 `npx wrangler pages dev . --port 8080` 测一遍。
 
 **CDN 依赖**：

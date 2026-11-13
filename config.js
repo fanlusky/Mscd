@@ -1,6 +1,7 @@
 export const config = {
     backend: 'https://api.qijieya.cn/meting/',
-    proxy: 'https://mscdownload.legspcpd.asia/proxy?url=',
+    // GitHub Pages 仅托管静态文件；如需代理，请填入自己部署的完整代理地址。
+    proxy: '',
 
     backends: {
         meting: {

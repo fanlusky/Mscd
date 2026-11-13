@@ -18,6 +18,7 @@ const corsWarnedOrigins = new Set();
 
 async function resolvePlaySrc(url, needCors) {
     if (!url) return '';
+    if (!config.proxy) return url;
     if (url.startsWith(config.proxy)) return url;
 
     const settings = store.get().settings;
